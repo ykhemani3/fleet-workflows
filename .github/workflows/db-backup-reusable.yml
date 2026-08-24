@@ -1,0 +1,57 @@
+# Reusable nightly pg_dump — one implementation for the whole fleet (D1).
+# Callers keep their own cron schedule + secret; this file owns the HOW:
+# version-matched client, custom-format dump, empty-dump guard, integrity
+# check, artifact upload. Introduced by the 2026-08 fleet review (OPS-3/6).
+name: DB Backup (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      retention_days:
+        description: Artifact retention in days
+        type: number
+        default: 30
+      app_id:
+        description: Short app name used in the artifact name
+        type: string
+        required: true
+    secrets:
+      DATABASE_URL_DIRECT:
+        required: true
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install version-matched postgres client
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt jammy-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update -qq && sudo apt-get install -yqq postgresql-client-17
+
+      - name: Dump
+        run: |
+          pg_dump --no-owner --no-privileges \
+                  --format=custom \
+                  --file "dump.dump" \
+                  "$DATABASE_URL_DIRECT"
+        env:
+          DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
+
+      - name: Guard against empty dumps + integrity check
+        run: |
+          SIZE=$(stat -c%s dump.dump)
+          echo "dump size: $SIZE bytes"
+          if [ "$SIZE" -lt 10240 ]; then
+            echo "::error::Dump suspiciously small ($SIZE bytes) — refusing to upload a useless backup"
+            exit 1
+          fi
+          pg_restore --list dump.dump > /dev/null
+          echo "integrity check passed"
+
+      - name: Upload dump as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_id }}-db-${{ github.run_id }}
+          path: dump.dump
+          retention-days: ${{ inputs.retention_days }}
