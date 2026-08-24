@@ -25,9 +25,14 @@ jobs:
     steps:
       - name: Install version-matched postgres client
         run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt jammy-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          # apt-key is gone from apt >= 3.0 — use signed-by keyring.
+          CODENAME=$(lsb_release -cs)
+          sudo sh -c "echo \"deb http://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main\" > /etc/apt/sources.list.d/pgdg.list"
+          wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
           sudo apt-get update -qq && sudo apt-get install -yqq postgresql-client-17
+          # The package does NOT go on PATH — /usr/bin/pg_dump stays the
+          # runner's older client and pg_dump refuses on version mismatch.
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
 
       - name: Dump
         run: |
