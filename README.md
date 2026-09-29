@@ -2,7 +2,7 @@
 
 Reusable GitHub Actions workflows for the Suraj fleet. Public so private
 app repos can call them. Currently: `db-backup-reusable.yml` — guarded
-nightly pg_dump (version-matched client, custom format, content
+nightly pg_dump (version-matched client, compressed custom format, content
 guard, integrity check, retention input). No secrets
 or code live here.
 
@@ -14,7 +14,7 @@ jobs:
     uses: ykhemani3/fleet-workflows/.github/workflows/db-backup-reusable.yml@main
     with:
       app_id: myapp
-      retention_days: 30
+      retention_days: 7
     secrets:
       DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
 ```
@@ -22,7 +22,8 @@ jobs:
 | Input | Default | What it does |
 |---|---|---|
 | `app_id` | required | Artifact name: `<app_id>-db-<run_id>`, holding `dump.dump` |
-| `retention_days` | `30` | How long GitHub keeps the artifact |
+| `retention_days` | `7` | How long GitHub keeps the artifact — see the storage arithmetic below |
+| `compression` | `zstd:level=9,long` | `pg_dump --compress` spec |
 | `min_tables` | `1` | Fail when the dump holds fewer tables |
 | `min_rows` | `1` | Fail when the dump holds fewer rows, not counting `_prisma_migrations`, `schema_migrations` or `migrations` tables |
 
@@ -35,6 +36,36 @@ because a reset refills them. The defaults only catch a database with no
 tables or no rows; set floors near your real counts (the run log lists the
 rows per table) to catch a partial loss. Reading the COPY blocks also
 decompresses every data block, so a corrupt dump fails here too.
+
+**Storage arithmetic.** Artifacts of private repos count against one
+account-wide Actions storage allowance (the Free plan includes 500 MB). When
+it runs out and no spending budget covers the overage, every upload fails
+with "Artifact storage quota has been hit", and all callers lose their backup
+the same night. The steady state is:
+
+    storage ≈ Σ over callers (dump size × retention_days × runs per day)
+
+A 90 MB dump kept 7 days holds 630 MB — over the Free allowance on its own.
+Kept 30 days, even a 5 MB dump holds 150 MB. Two levers: `retention_days`
+(the default is 7) and `compression`. Measured on two synthetic databases
+(one text-heavy, one full of UUIDs), against pg_dump's default gzip:
+
+| `compression` | Size | Time |
+|---|---|---|
+| `gzip` (pg_dump's default) | 100% | 1× |
+| `zstd:level=9,long` (this workflow's default) | 68–87% | 1.6–2.3× |
+| `zstd:level=19,long` | 35–64% | 37–42× |
+
+Level 19 is worth its CPU time only for the largest dump. Keep more history
+somewhere other than Actions storage, not by raising `retention_days`
+across the board.
+
+**Restoring a dump.** It needs pg_restore 17 built with zstd (Homebrew
+`postgresql@17` and the apt.postgresql.org packages are).
+
+    gh run download <run-id> -R <owner>/<repo>    # a folder holding dump.dump
+    createdb scratch
+    pg_restore --no-owner --no-privileges -d scratch <app_id>-db-<run-id>/dump.dump
 
 ## Tests
 

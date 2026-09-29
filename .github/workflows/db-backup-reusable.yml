@@ -1,6 +1,6 @@
 # Reusable nightly pg_dump — one implementation for the whole fleet (D1).
 # Callers keep their own cron schedule + secret; this file owns the HOW:
-# version-matched client, custom-format dump, content guard
+# version-matched client, compressed custom-format dump, content guard
 # (tables + rows), integrity check, artifact upload. Introduced by the
 # 2026-08 fleet review (OPS-3/6).
 # Every input except app_id has a default, so existing callers keep working.
@@ -10,13 +10,17 @@ on:
   workflow_call:
     inputs:
       retention_days:
-        description: Artifact retention in days
+        description: Artifact retention in days (storage arithmetic in README)
         type: number
-        default: 30
+        default: 7
       app_id:
         description: Short app name used in the artifact name
         type: string
         required: true
+      compression:
+        description: pg_dump --compress spec for the custom-format dump
+        type: string
+        default: zstd:level=9,long
       min_tables:
         description: Fail when the dump holds fewer tables than this
         type: number
@@ -51,10 +55,12 @@ jobs:
         run: |
           pg_dump --no-owner --no-privileges \
                   --format=custom \
+                  --compress="$COMPRESSION" \
                   --file "dump.dump" \
                   "$DATABASE_URL_DIRECT"
         env:
           DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
+          COMPRESSION: ${{ inputs.compression }}
 
       # A wiped database still dumps to tens or hundreds of KB (its schema is
       # all still there), so size proves nothing: count what is inside instead.
@@ -100,4 +106,7 @@ jobs:
           name: ${{ inputs.app_id }}-db-${{ github.run_id }}
           path: dump.dump
           retention-days: ${{ inputs.retention_days }}
+          # The dump is already compressed; zipping it again only costs time.
+          compression-level: 0
+          if-no-files-found: error
 

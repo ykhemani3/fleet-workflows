@@ -62,6 +62,7 @@ ruby -ryaml -e '
   runs = w["jobs"]["dump"]["steps"].map { |s| s["run"].to_s }.join
   abort("a run: script uses a ${{ }} expression; pass it through env:") if runs.include?("${{")
 ' "$WF" && ok "every new input has a default; no expressions inside run: scripts" || bad "input contract"
+[ "$(input_default retention_days)" = "7" ] && ok "retention_days defaults to 7" || bad "retention_days default"
 
 echo "== fixtures"
 make_db() { createdb "${PREFIX}_$1" && psql -X -q -v ON_ERROR_STOP=1 -d "${PREFIX}_$1"; }
@@ -87,11 +88,13 @@ SQL
 make_db notables </dev/null || exit 1
 ok "3 databases created"
 
+COMPRESSION=$(input_default compression)
 for db in full reset notables; do
   mkdir -p "$WORK/$db"
-  run_step "$WORK/$db" dump DATABASE_URL_DIRECT="${PREFIX}_$db" || { bad "pg_dump of $db"; continue; }
+  run_step "$WORK/$db" dump COMPRESSION="$COMPRESSION" DATABASE_URL_DIRECT="${PREFIX}_$db" \
+    || { bad "pg_dump --compress=$COMPRESSION of $db"; continue; }
 done
-ok "dumped"
+ok "dumped with the default compression ($COMPRESSION)"
 
 echo "== content guard"
 guard() { run_step "$WORK/$1" guard MIN_TABLES="$2" MIN_ROWS="$3" > "$WORK/$1/guard.out" 2>&1; }
