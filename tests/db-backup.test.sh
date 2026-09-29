@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs db-backup-reusable.yml's own step scripts (extracted verbatim from the
-# YAML) against throwaway local databases, so the guard is tested as
-# shipped. Needs: a reachable postgres whose role may create
+# YAML) against throwaway local databases, so the guard and the restore drill
+# are tested as shipped. Needs: a reachable postgres whose role may create
 # databases (PG* env vars, or the local socket), a v17 client on PATH, ruby.
 #
 #   PATH=/opt/homebrew/opt/postgresql@17/bin:$PATH tests/db-backup.test.sh
@@ -20,7 +20,7 @@ WORK=$(mktemp -d)
 pass=0; failed=0
 
 cleanup() {
-  for db in full reset notables; do dropdb --if-exists "${PREFIX}_$db" >/dev/null 2>&1; done
+  for db in full reset notables trap drill; do dropdb --if-exists "${PREFIX}_$db" >/dev/null 2>&1; done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -44,6 +44,8 @@ input_default() {
 
 step "Dump" > "$WORK/dump.sh" || exit 1
 step "Content guard + integrity check" > "$WORK/guard.sh" || exit 1
+step "Start scratch postgres for the restore drill" > "$WORK/start.sh" || exit 1
+step "Restore drill" > "$WORK/drill.sh" || exit 1
 
 # Runs a step script the way GitHub runs `shell: bash`, in its own work dir.
 run_step() { # dir script [VAR=value ...]
@@ -63,6 +65,7 @@ ruby -ryaml -e '
   abort("a run: script uses a ${{ }} expression; pass it through env:") if runs.include?("${{")
 ' "$WF" && ok "every new input has a default; no expressions inside run: scripts" || bad "input contract"
 [ "$(input_default retention_days)" = "7" ] && ok "retention_days defaults to 7" || bad "retention_days default"
+[ "$(input_default restore_drill)" = "false" ] && ok "restore drill is opt-in" || bad "restore_drill default"
 
 echo "== fixtures"
 make_db() { createdb "${PREFIX}_$1" && psql -X -q -v ON_ERROR_STOP=1 -d "${PREFIX}_$1"; }
@@ -86,10 +89,18 @@ make_db reset <<SQL || exit 1
 $SCHEMA_SQL
 SQL
 make_db notables </dev/null || exit 1
-ok "3 databases created"
+# A table whose rows cannot load into any other database: the restore drill
+# must notice the rows that did not come back.
+make_db trap <<SQL || exit 1
+create table kept (id int);
+insert into kept select generate_series(1, 3);
+create table trap (id int, check (current_database() = '${PREFIX}_trap'));
+insert into trap select generate_series(1, 4);
+SQL
+ok "4 databases created"
 
 COMPRESSION=$(input_default compression)
-for db in full reset notables; do
+for db in full reset notables trap; do
   mkdir -p "$WORK/$db"
   run_step "$WORK/$db" dump COMPRESSION="$COMPRESSION" DATABASE_URL_DIRECT="${PREFIX}_$db" \
     || { bad "pg_dump --compress=$COMPRESSION of $db"; continue; }
@@ -116,6 +127,38 @@ mkdir -p "$WORK/cut"
 size=$(wc -c < "$WORK/full/dump.dump")
 head -c $((size * 3 / 4)) "$WORK/full/dump.dump" > "$WORK/cut/dump.dump"
 guard cut 1 1 && bad "a truncated dump passed" || ok "a truncated dump fails"
+
+echo "== restore drill"
+# The start step, with docker stubbed: it must ask for the dump's own major.
+mkdir -p "$WORK/bin"
+printf '#!/bin/sh\necho "$@" > "%s/docker.args"\n' "$WORK" > "$WORK/bin/docker"
+chmod +x "$WORK/bin/docker"
+major=$(psql -X -At -d "${PREFIX}_full" -c "select current_setting('server_version_num')::int / 10000")
+if run_step "$WORK/full" start PATH="$WORK/bin:$PATH" PGPORT="${PGPORT:-5432}" > /dev/null 2>&1 \
+   && grep -q "postgres:$major\$" "$WORK/docker.args"; then
+  ok "scratch server is postgres:$major, the dump's own major"
+else bad "start step (docker args: $(cat "$WORK/docker.args" 2>/dev/null))"; fi
+
+drill() { # dir [RESTORE_SCHEMA]
+  dropdb --if-exists "${PREFIX}_drill" >/dev/null 2>&1
+  run_step "$WORK/$1" drill DRILL_DB="${PREFIX}_drill" RESTORE_SCHEMA="${2:-}" > "$WORK/$1/drill.out" 2>&1
+}
+guard trap 1 1 || bad "trap dump refused by the guard"
+if drill full; then
+  grep -q 'restore drill: 6 of 6 tables, 14 of 14 rows' "$WORK/full/drill.out" \
+    && ok "full restore: every table and row back" || { bad "full restore counts"; cat "$WORK/full/drill.out"; }
+else bad "full restore drill failed"; cat "$WORK/full/drill.out"; fi
+if drill full app; then
+  grep -q 'restore drill: 1 of 1 tables, 4 of 4 rows' "$WORK/full/drill.out" \
+    && ok "restore_schema=app restores and checks just that schema" || { bad "schema drill counts"; cat "$WORK/full/drill.out"; }
+else bad "schema restore drill failed"; cat "$WORK/full/drill.out"; fi
+drill full nosuch && bad "a schema with no tables passed" || ok "restore_schema with no tables fails"
+if drill trap; then bad "rows that did not restore went unnoticed"; cat "$WORK/trap/drill.out"
+else
+  grep -q 'only 3 of the dump.s 7 rows came back' "$WORK/trap/drill.out" && grep -q '::warning::pg_restore reported' "$WORK/trap/drill.out" \
+    && ok "missing rows fail the drill; the restore error is a warning" || { bad "trap: wrong reason"; cat "$WORK/trap/drill.out"; }
+  grep -q 'Failing row contains' "$WORK/trap/drill.out" && bad "a failed COPY's row reached the log" || ok "no row data in the log"
+fi
 
 echo "== $pass passed, $failed failed"
 [ "$failed" -eq 0 ]

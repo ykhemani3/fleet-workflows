@@ -1,8 +1,8 @@
 # Reusable nightly pg_dump — one implementation for the whole fleet (D1).
 # Callers keep their own cron schedule + secret; this file owns the HOW:
 # version-matched client, compressed custom-format dump, content guard
-# (tables + rows), integrity check, artifact upload. Introduced by the
-# 2026-08 fleet review (OPS-3/6).
+# (tables + rows), integrity check, artifact upload, and an opt-in restore
+# drill. Introduced by the 2026-08 fleet review (OPS-3/6).
 # Every input except app_id has a default, so existing callers keep working.
 name: DB Backup (reusable)
 
@@ -29,6 +29,14 @@ on:
         description: Fail when the dump holds fewer rows than this, not counting migration-bookkeeping tables
         type: number
         default: 1
+      restore_drill:
+        description: Also restore the dump into a scratch postgres of the same major version and check its tables and rows
+        type: boolean
+        default: false
+      restore_schema:
+        description: Restore drill only — restore and check just this schema (empty = every schema)
+        type: string
+        default: ''
     secrets:
       DATABASE_URL_DIRECT:
         required: true
@@ -110,3 +118,94 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+      # Restore drill (opt-in). It runs after the upload, so a failed drill
+      # never costs the night's backup; it only turns the run red.
+      - name: Start scratch postgres for the restore drill
+        if: inputs.restore_drill
+        run: |
+          set -euo pipefail
+          major=$(sed -n 's/^;[[:space:]]*Dumped from database version: \([0-9][0-9]*\).*/\1/p' toc.txt)
+          if [ -z "$major" ]; then
+            echo "::error::Cannot read the server's major version from the dump"
+            exit 1
+          fi
+          docker run --detach --name drill-pg \
+                     --env POSTGRES_HOST_AUTH_METHOD=trust \
+                     --publish "127.0.0.1:$PGPORT:5432" "postgres:$major"
+          for _ in $(seq 1 60); do
+            if pg_isready --quiet; then echo "scratch postgres:$major is up"; exit 0; fi
+            sleep 2
+          done
+          echo "::error::Scratch postgres:$major did not start"
+          exit 1
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 55432
+          PGUSER: postgres
+
+      - name: Restore drill
+        if: inputs.restore_drill
+        run: |
+          set -euo pipefail
+          schema_opt=""
+          if [ -n "$RESTORE_SCHEMA" ]; then
+            schema_opt="--schema=$RESTORE_SCHEMA"
+            want_tables=$(awk -v s="$RESTORE_SCHEMA" '$4 == "TABLE" && $5 != "DATA" && $5 != "ATTACH" && $5 == s { n++ } END { print n + 0 }' toc.txt)
+            want_rows=$(awk -v s="$RESTORE_SCHEMA" 'index($2, s ".") == 1 || index($2, "\"" s "\".") == 1 { n += $1 } END { print n + 0 }' rows.txt)
+          else
+            want_tables=$(awk '$4 == "TABLE" && $5 != "DATA" && $5 != "ATTACH" { n++ } END { print n + 0 }' toc.txt)
+            want_rows=$(awk '{ n += $1 } END { print n + 0 }' rows.txt)
+          fi
+          if [ "$want_tables" -eq 0 ]; then
+            echo "::error::The dump holds no tables to restore${RESTORE_SCHEMA:+ in schema $RESTORE_SCHEMA}"
+            exit 1
+          fi
+          createdb "$DRILL_DB"
+          if [ -n "$RESTORE_SCHEMA" ]; then
+            # pg_restore --schema restores the schema's objects, not the schema.
+            echo 'create schema if not exists :"s";' | psql -X -q -v ON_ERROR_STOP=1 -v s="$RESTORE_SCHEMA" -d "$DRILL_DB"
+          fi
+          rc=0
+          pg_restore --no-owner --no-privileges ${schema_opt:+"$schema_opt"} --dbname="$DRILL_DB" dump.dump 2> restore.err || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            errors=$(sed -n 's/.*errors ignored on restore: \([0-9][0-9]*\).*/\1/p' restore.err)
+            if [ -z "$errors" ]; then
+              cat restore.err
+              echo "::error::pg_restore failed outright (exit $rc)"
+              exit 1
+            fi
+            # Objects a vanilla postgres cannot create (a platform extension, a
+            # role a policy names). Only each error's headline is printed: the
+            # DETAIL line of a failed COPY can quote a row.
+            echo "::warning::pg_restore reported $errors errors; the table and row checks below decide pass or fail"
+            grep '^pg_restore: error:' restore.err | head -n 20 || true
+          fi
+          got_tables=$(psql -X -At -v ON_ERROR_STOP=1 -d "$DRILL_DB" -c "
+            select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            where c.relkind in ('r', 'p') and n.nspname !~ '^pg_' and n.nspname <> 'information_schema'")
+          # Leaf tables only (a partitioned parent's count repeats its
+          # partitions'), and not the tables an extension brings with it.
+          got_rows=$(psql -X -At -v ON_ERROR_STOP=1 -d "$DRILL_DB" -c "
+            select coalesce(sum((xpath('/row/n/text()', query_to_xml(
+                     format('select count(*) as n from %I.%I', n.nspname, c.relname),
+                     false, true, '')))[1]::text::bigint), 0)
+            from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            where c.relkind = 'r' and n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
+              and not exists (select 1 from pg_depend d where d.classid = 'pg_class'::regclass
+                              and d.objid = c.oid and d.deptype = 'e')")
+          echo "restore drill: $got_tables of $want_tables tables, $got_rows of $want_rows rows"
+          if [ "$got_tables" -lt "$want_tables" ]; then
+            echo "::error::Restore drill: only $got_tables of the dump's $want_tables tables came back"
+            exit 1
+          fi
+          if [ "$got_rows" -lt "$want_rows" ]; then
+            echo "::error::Restore drill: only $got_rows of the dump's $want_rows rows came back"
+            exit 1
+          fi
+          echo "restore drill passed"
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 55432
+          PGUSER: postgres
+          DRILL_DB: drill
+          RESTORE_SCHEMA: ${{ inputs.restore_schema }}
