@@ -29,14 +29,14 @@ on:
         description: Fail when the dump holds fewer rows than this, not counting migration-bookkeeping tables
         type: number
         default: 1
+      check_schema:
+        description: Count (and restore-drill) only this schema, e.g. public on Supabase; empty = every schema
+        type: string
+        default: ''
       restore_drill:
         description: Also restore the dump into a scratch postgres of the same major version and check its tables and rows
         type: boolean
         default: false
-      restore_schema:
-        description: Restore drill only — restore and check just this schema (empty = every schema)
-        type: string
-        default: ''
     secrets:
       DATABASE_URL_DIRECT:
         required: true
@@ -78,22 +78,34 @@ jobs:
         run: |
           set -euo pipefail
           pg_restore --list dump.dump > toc.txt
-          tables=$(awk '$4 == "TABLE" && $5 != "DATA" && $5 != "ATTACH" { n++ } END { print n + 0 }' toc.txt)
-          # rows.txt: "<rows> <schema.table>", one line per table with data.
+          # rows.txt: "<rows>TAB<schema.table>" (named as in the COPY line), one
+          # line per table with data.
           pg_restore --data-only --file=- dump.dump | awk '
-            !copying && /^COPY / { copying = 1; table = $2; rows = 0; next }
-            copying && $0 == "\\." { print rows, table; copying = 0; next }
+            !copying && /^COPY / {
+              copying = 1; rows = 0; table = substr($0, 6)
+              sub(/ \(.*\) FROM stdin;$/, "", table); sub(/ +FROM stdin;$/, "", table)
+              next
+            }
+            copying && $0 == "\\." { print rows "\t" table; copying = 0; next }
             copying { rows++ }
           ' > rows.txt
-          total=$(awk '{ n += $1 } END { print n + 0 }' rows.txt)
+          # With check_schema set, only that schema's tables count (a Supabase
+          # dump also carries auth, storage and the rest, which a wipe of public
+          # leaves alone). tables.txt and rows-checked.txt feed the drill.
+          awk -v s="$CHECK_SCHEMA" '$4 == "TABLE" && $5 != "DATA" && $5 != "ATTACH" && (s == "" || $5 == s) { n++ }
+            END { print n + 0 }' toc.txt > tables.txt
+          awk -F '\t' -v s="$CHECK_SCHEMA" 's == "" || index($2, s ".") == 1 || index($2, "\"" s "\".") == 1' \
+            rows.txt > rows-checked.txt
+          tables=$(cat tables.txt)
+          total=$(awk -F '\t' '{ n += $1 } END { print n + 0 }' rows-checked.txt)
           # A reset re-applies the migrations, which refills these tables, so
           # they do not count towards min_rows.
-          counted=$(awk '{ t = $2; sub(/^.*\./, "", t); gsub(/"/, "", t) }
+          counted=$(awk -F '\t' '{ t = $2; sub(/^.*\./, "", t); gsub(/"/, "", t) }
             t !~ /^(_prisma_migrations|schema_migrations|migrations)$/ { n += $1 }
-            END { print n + 0 }' rows.txt)
-          echo "dump: $(wc -c < dump.dump | tr -d ' ') bytes, $tables tables, $total rows ($counted outside migration bookkeeping)"
+            END { print n + 0 }' rows-checked.txt)
+          echo "dump: $(wc -c < dump.dump | tr -d ' ') bytes, $tables tables, $total rows ($counted outside migration bookkeeping)${CHECK_SCHEMA:+ in schema $CHECK_SCHEMA}"
           echo "::group::rows per table"
-          sort -nr rows.txt
+          sort -nr rows-checked.txt
           echo "::endgroup::"
           if [ "$tables" -lt "$MIN_TABLES" ]; then
             echo "::error::Dump holds $tables tables, fewer than min_tables=$MIN_TABLES — refusing to upload it as a good backup"
@@ -107,6 +119,7 @@ jobs:
         env:
           MIN_TABLES: ${{ inputs.min_tables }}
           MIN_ROWS: ${{ inputs.min_rows }}
+          CHECK_SCHEMA: ${{ inputs.check_schema }}
 
       - name: Upload dump as artifact
         uses: actions/upload-artifact@v4
@@ -147,23 +160,17 @@ jobs:
         if: inputs.restore_drill
         run: |
           set -euo pipefail
-          schema_opt=""
-          if [ -n "$RESTORE_SCHEMA" ]; then
-            schema_opt="--schema=$RESTORE_SCHEMA"
-            want_tables=$(awk -v s="$RESTORE_SCHEMA" '$4 == "TABLE" && $5 != "DATA" && $5 != "ATTACH" && $5 == s { n++ } END { print n + 0 }' toc.txt)
-            want_rows=$(awk -v s="$RESTORE_SCHEMA" 'index($2, s ".") == 1 || index($2, "\"" s "\".") == 1 { n += $1 } END { print n + 0 }' rows.txt)
-          else
-            want_tables=$(awk '$4 == "TABLE" && $5 != "DATA" && $5 != "ATTACH" { n++ } END { print n + 0 }' toc.txt)
-            want_rows=$(awk '{ n += $1 } END { print n + 0 }' rows.txt)
-          fi
+          want_tables=$(cat tables.txt)
           if [ "$want_tables" -eq 0 ]; then
-            echo "::error::The dump holds no tables to restore${RESTORE_SCHEMA:+ in schema $RESTORE_SCHEMA}"
+            echo "::error::The dump holds no tables to restore${CHECK_SCHEMA:+ in schema $CHECK_SCHEMA}"
             exit 1
           fi
           createdb "$DRILL_DB"
-          if [ -n "$RESTORE_SCHEMA" ]; then
+          schema_opt=""
+          if [ -n "$CHECK_SCHEMA" ]; then
+            schema_opt="--schema=$CHECK_SCHEMA"
             # pg_restore --schema restores the schema's objects, not the schema.
-            echo 'create schema if not exists :"s";' | psql -X -q -v ON_ERROR_STOP=1 -v s="$RESTORE_SCHEMA" -d "$DRILL_DB"
+            echo 'create schema if not exists :"s";' | psql -X -q -v ON_ERROR_STOP=1 -v s="$CHECK_SCHEMA" -d "$DRILL_DB"
           fi
           rc=0
           pg_restore --no-owner --no-privileges ${schema_opt:+"$schema_opt"} --dbname="$DRILL_DB" dump.dump 2> restore.err || rc=$?
@@ -180,25 +187,34 @@ jobs:
             echo "::warning::pg_restore reported $errors errors; the table and row checks below decide pass or fail"
             grep '^pg_restore: error:' restore.err | head -n 20 || true
           fi
+          # Tables an extension creates are not in the dump's table count.
           got_tables=$(psql -X -At -v ON_ERROR_STOP=1 -d "$DRILL_DB" -c "
             select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
-            where c.relkind in ('r', 'p') and n.nspname !~ '^pg_' and n.nspname <> 'information_schema'")
-          # Leaf tables only (a partitioned parent's count repeats its
-          # partitions'), and not the tables an extension brings with it.
-          got_rows=$(psql -X -At -v ON_ERROR_STOP=1 -d "$DRILL_DB" -c "
-            select coalesce(sum((xpath('/row/n/text()', query_to_xml(
-                     format('select count(*) as n from %I.%I', n.nspname, c.relname),
-                     false, true, '')))[1]::text::bigint), 0)
-            from pg_class c join pg_namespace n on n.oid = c.relnamespace
-            where c.relkind = 'r' and n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
+            where c.relkind in ('r', 'p') and n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
               and not exists (select 1 from pg_depend d where d.classid = 'pg_class'::regclass
                               and d.objid = c.oid and d.deptype = 'e')")
+          # Every table the dump holds rows for must hold at least as many
+          # after the restore, compared table by table under the dump's names.
+          psql -X -At -F "$(printf '\t')" -v ON_ERROR_STOP=1 -d "$DRILL_DB" -c "
+            select format('%I.%I', n.nspname, c.relname),
+                   (xpath('/row/n/text()', query_to_xml(
+                     format('select count(*) as n from %I.%I', n.nspname, c.relname),
+                     false, true, '')))[1]::text
+            from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            where c.relkind = 'r' and n.nspname !~ '^pg_' and n.nspname <> 'information_schema'" > restored.txt
+          short=$(awk -F '\t' 'FILENAME == ARGV[1] { got[$1] = $2; next }
+            !($2 in got) { print "  missing: " $2 " (" $1 " rows in the dump)"; next }
+            got[$2] + 0 < $1 + 0 { print "  short: " $2 " has " got[$2] " of " $1 " rows" }' restored.txt rows-checked.txt)
+          want_rows=$(awk -F '\t' '{ n += $1 } END { print n + 0 }' rows-checked.txt)
+          got_rows=$(awk -F '\t' 'FILENAME == ARGV[1] { got[$1] = $2; next }
+            { n += (got[$2] + 0 < $1 + 0 ? got[$2] + 0 : $1 + 0) } END { print n + 0 }' restored.txt rows-checked.txt)
           echo "restore drill: $got_tables of $want_tables tables, $got_rows of $want_rows rows"
           if [ "$got_tables" -lt "$want_tables" ]; then
             echo "::error::Restore drill: only $got_tables of the dump's $want_tables tables came back"
             exit 1
           fi
-          if [ "$got_rows" -lt "$want_rows" ]; then
+          if [ -n "$short" ]; then
+            echo "$short"
             echo "::error::Restore drill: only $got_rows of the dump's $want_rows rows came back"
             exit 1
           fi
@@ -208,4 +224,4 @@ jobs:
           PGPORT: 55432
           PGUSER: postgres
           DRILL_DB: drill
-          RESTORE_SCHEMA: ${{ inputs.restore_schema }}
+          CHECK_SCHEMA: ${{ inputs.check_schema }}

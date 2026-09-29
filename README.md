@@ -26,8 +26,8 @@ jobs:
 | `compression` | `zstd:level=9,long` | `pg_dump --compress` spec |
 | `min_tables` | `1` | Fail when the dump holds fewer tables |
 | `min_rows` | `1` | Fail when the dump holds fewer rows, not counting `_prisma_migrations`, `schema_migrations` or `migrations` tables |
+| `check_schema` | `''` | Count, and restore-drill, only this schema (empty = every schema) |
 | `restore_drill` | `false` | Also restore the dump into a scratch postgres and check it |
-| `restore_schema` | `''` | Restore drill only: restore and check just this schema |
 
 **Content guard.** A wiped database still dumps to tens or hundreds of KB,
 because its schema is all still there, so the size of a dump proves nothing.
@@ -36,17 +36,21 @@ its COPY blocks, and refuses to upload a dump below `min_tables` or
 `min_rows`. The migration-bookkeeping tables are left out of the row count
 because a reset refills them. The defaults only catch a database with no
 tables or no rows; set floors near your real counts (the run log lists the
-rows per table) to catch a partial loss. Reading the COPY blocks also
+rows per table) to catch a partial loss. On Supabase set `check_schema:
+public`: the dump also carries auth, storage and the platform's other
+schemas, which a wipe of public leaves full. Reading the COPY blocks also
 decompresses every data block, so a corrupt dump fails here too.
 
 **Restore drill.** With `restore_drill: true`, after the upload the job
 starts `postgres:<major>` (the major version the dump came from), restores
 the dump with `pg_restore --no-owner --no-privileges`, and fails unless every
-table and row of the dump came back. Restore errors on objects a vanilla
-postgres cannot create (a platform extension, a role named in a policy) are
-reported as warnings; the table and row checks decide. For a Supabase
-database, set `restore_schema: public`. The drill runs after the upload, so
-a failed drill never costs the night's backup. Run it weekly from a separate
+table came back and every table holds at least the rows the dump has for it
+(any that fall short are named). Restore errors on objects a vanilla postgres
+cannot create (a platform extension, a role named in a policy) are reported
+as warnings; the table and row checks decide. `check_schema` scopes the drill
+too. The drill runs after the upload, so a failed drill never costs the
+night's backup. Either set `restore_drill: true` on the nightly caller (no
+extra dump, a few more minutes a night), or run it weekly from a separate
 workflow in the caller repo, keeping its artifact for one day only:
 
 ```yaml
@@ -77,7 +81,8 @@ the same night. The steady state is:
 
 A 90 MB dump kept 7 days holds 630 MB — over the Free allowance on its own.
 Kept 30 days, even a 5 MB dump holds 150 MB. Two levers: `retention_days`
-(the default is 7) and `compression`. Measured on two synthetic databases
+(the default is 7; a caller that passes its own value keeps it) and
+`compression`. Measured on two synthetic databases
 (one text-heavy, one full of UUIDs), against pg_dump's default gzip:
 
 | `compression` | Size | Time |
@@ -90,8 +95,9 @@ Level 19 is worth its CPU time only for the largest dump. Keep more history
 somewhere other than Actions storage, not by raising `retention_days`
 across the board.
 
-**Restoring a dump.** It needs pg_restore 17 built with zstd (Homebrew
-`postgresql@17` and the apt.postgresql.org packages are).
+**Restoring a dump.** It needs pg_restore 17, which pg_dump 17's archive
+format needs anyway, built with zstd (Homebrew `postgresql@17` and the
+apt.postgresql.org packages are).
 
     gh run download <run-id> -R <owner>/<repo>    # a folder holding dump.dump
     createdb scratch
@@ -102,4 +108,5 @@ across the board.
 `tests/db-backup.test.sh` runs the workflow's own step scripts, extracted
 from the YAML, against throwaway databases: the input contract, the content
 guard, and the restore drill. It needs a v17 client on `PATH`, ruby, and a
-postgres whose role may create databases. `test.yml` runs it on every push.
+postgres whose role may create databases. `test.yml` runs it on pushes to
+main and on pull requests.

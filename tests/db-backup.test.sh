@@ -20,7 +20,7 @@ WORK=$(mktemp -d)
 pass=0; failed=0
 
 cleanup() {
-  for db in full reset notables trap drill; do dropdb --if-exists "${PREFIX}_$db" >/dev/null 2>&1; done
+  for db in full reset half notables trap drill; do dropdb --if-exists "${PREFIX}_$db" >/dev/null 2>&1; done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -82,11 +82,18 @@ make_db full <<SQL || exit 1
 $SCHEMA_SQL
 insert into "User" (name) select 'user ' || g from generate_series(1, 5) g;
 insert into ev values (1, '2026-02-01'), (2, '2026-03-01');
+create table "Odd Name" (id int);
+insert into "Odd Name" values (1), (2);
 insert into app.item values (1, E'two\nlines'), (2, E'back\\\\slash'), (3, E'tab\there'), (4, '\.');
 SQL
 # What a migrate reset leaves: every table, only the migrations rows.
 make_db reset <<SQL || exit 1
 $SCHEMA_SQL
+SQL
+# public wiped, another schema untouched: Supabase after a reset of public.
+make_db half <<SQL || exit 1
+$SCHEMA_SQL
+insert into app.item values (1, 'kept');
 SQL
 make_db notables </dev/null || exit 1
 # A table whose rows cannot load into any other database: the restore drill
@@ -97,30 +104,39 @@ insert into kept select generate_series(1, 3);
 create table trap (id int, check (current_database() = '${PREFIX}_trap'));
 insert into trap select generate_series(1, 4);
 SQL
-ok "4 databases created"
+ok "5 databases created"
 
 COMPRESSION=$(input_default compression)
-for db in full reset notables trap; do
+dumped=0
+for db in full reset half notables trap; do
   mkdir -p "$WORK/$db"
   run_step "$WORK/$db" dump COMPRESSION="$COMPRESSION" DATABASE_URL_DIRECT="${PREFIX}_$db" \
-    || { bad "pg_dump --compress=$COMPRESSION of $db"; continue; }
+    && dumped=$((dumped + 1)) || bad "pg_dump --compress=$COMPRESSION of $db"
 done
-ok "dumped with the default compression ($COMPRESSION)"
+[ "$dumped" -eq 5 ] && ok "dumped with the default compression ($COMPRESSION)" || { echo "cannot test without dumps"; exit 1; }
 
 echo "== content guard"
-guard() { run_step "$WORK/$1" guard MIN_TABLES="$2" MIN_ROWS="$3" > "$WORK/$1/guard.out" 2>&1; }
+guard() { # dir min_tables min_rows [check_schema]
+  run_step "$WORK/$1" guard MIN_TABLES="$2" MIN_ROWS="$3" CHECK_SCHEMA="${4:-}" > "$WORK/$1/guard.out" 2>&1
+}
 if guard full 1 1; then
-  grep -q '6 tables, 14 rows (11 outside migration bookkeeping)' "$WORK/full/guard.out" \
-    && ok "healthy dump passes and is counted exactly (partitions, escapes, a lone \\.)" \
+  grep -q '7 tables, 16 rows (13 outside migration bookkeeping)' "$WORK/full/guard.out" \
+    && ok "healthy dump passes and is counted exactly (partitions, escapes, a lone \\., a quoted name)" \
     || { bad "healthy dump counts"; cat "$WORK/full/guard.out"; }
 else bad "healthy dump refused"; cat "$WORK/full/guard.out"; fi
-guard full 6 11 && ok "passes at exactly min_tables=6, min_rows=11" || bad "boundary refused"
-guard full 7 1 && bad "min_tables=7 let a 6-table dump through" \
-  || { grep -q '6 tables, fewer than min_tables=7' "$WORK/full/guard.out" && ok "min_tables above the dump fails" || bad "min_tables: wrong reason"; }
-guard full 1 12 && bad "min_rows=12 let an 11-row dump through" \
-  || { grep -q '11 rows outside migration bookkeeping, fewer than min_rows=12' "$WORK/full/guard.out" && ok "min_rows above the dump fails" || bad "min_rows: wrong reason"; }
+guard full 7 13 && ok "passes at exactly min_tables=7, min_rows=13" || bad "boundary refused"
+guard full 8 1 && bad "min_tables=8 let a 7-table dump through" \
+  || { grep -q '7 tables, fewer than min_tables=8' "$WORK/full/guard.out" && ok "min_tables above the dump fails" || bad "min_tables: wrong reason"; }
+guard full 1 14 && bad "min_rows=14 let a 13-row dump through" \
+  || { grep -q '13 rows outside migration bookkeeping, fewer than min_rows=14' "$WORK/full/guard.out" && ok "min_rows above the dump fails" || bad "min_rows: wrong reason"; }
 guard reset 1 1 && bad "a reset database (schema + migrations only) passed" \
   || { grep -q 'fewer than min_rows=1' "$WORK/reset/guard.out" && ok "a reset database fails at the default thresholds" || bad "reset: wrong reason"; }
+guard half 1 1 && ok "public wiped, app intact: passes when every schema counts" || bad "half: refused unscoped"
+guard half 1 1 public && bad "check_schema=public let a wiped public through" \
+  || { grep -q '0 rows outside migration bookkeeping, fewer than min_rows=1' "$WORK/half/guard.out" \
+       && ok "check_schema=public catches a wiped public beside intact schemas" || bad "half: wrong reason"; }
+guard full 1 4 app && grep -q '1 tables, 4 rows (4 outside migration bookkeeping) in schema app' "$WORK/full/guard.out" \
+  && ok "check_schema counts just that schema" || { bad "check_schema counts"; cat "$WORK/full/guard.out"; }
 guard notables 1 1 && bad "a database with no tables passed" \
   || { grep -q 'fewer than min_tables=1' "$WORK/notables/guard.out" && ok "a database with no tables fails" || bad "notables: wrong reason"; }
 mkdir -p "$WORK/cut"
@@ -139,24 +155,25 @@ if run_step "$WORK/full" start PATH="$WORK/bin:$PATH" PGPORT="${PGPORT:-5432}" >
   ok "scratch server is postgres:$major, the dump's own major"
 else bad "start step (docker args: $(cat "$WORK/docker.args" 2>/dev/null))"; fi
 
-drill() { # dir [RESTORE_SCHEMA]
+drill() { # dir [check_schema] — the guard runs first, as in the workflow
   dropdb --if-exists "${PREFIX}_drill" >/dev/null 2>&1
-  run_step "$WORK/$1" drill DRILL_DB="${PREFIX}_drill" RESTORE_SCHEMA="${2:-}" > "$WORK/$1/drill.out" 2>&1
+  guard "$1" 0 0 "${2:-}" || { echo "guard failed before the drill" > "$WORK/$1/drill.out"; return 1; }
+  run_step "$WORK/$1" drill DRILL_DB="${PREFIX}_drill" CHECK_SCHEMA="${2:-}" > "$WORK/$1/drill.out" 2>&1
 }
-guard trap 1 1 || bad "trap dump refused by the guard"
 if drill full; then
-  grep -q 'restore drill: 6 of 6 tables, 14 of 14 rows' "$WORK/full/drill.out" \
+  grep -q 'restore drill: 7 of 7 tables, 16 of 16 rows' "$WORK/full/drill.out" \
     && ok "full restore: every table and row back" || { bad "full restore counts"; cat "$WORK/full/drill.out"; }
 else bad "full restore drill failed"; cat "$WORK/full/drill.out"; fi
 if drill full app; then
   grep -q 'restore drill: 1 of 1 tables, 4 of 4 rows' "$WORK/full/drill.out" \
-    && ok "restore_schema=app restores and checks just that schema" || { bad "schema drill counts"; cat "$WORK/full/drill.out"; }
+    && ok "check_schema=app restores and checks just that schema" || { bad "schema drill counts"; cat "$WORK/full/drill.out"; }
 else bad "schema restore drill failed"; cat "$WORK/full/drill.out"; fi
-drill full nosuch && bad "a schema with no tables passed" || ok "restore_schema with no tables fails"
+drill full nosuch && bad "a schema with no tables passed" || ok "check_schema with no tables fails"
 if drill trap; then bad "rows that did not restore went unnoticed"; cat "$WORK/trap/drill.out"
 else
-  grep -q 'only 3 of the dump.s 7 rows came back' "$WORK/trap/drill.out" && grep -q '::warning::pg_restore reported' "$WORK/trap/drill.out" \
-    && ok "missing rows fail the drill; the restore error is a warning" || { bad "trap: wrong reason"; cat "$WORK/trap/drill.out"; }
+  grep -q 'only 3 of the dump.s 7 rows came back' "$WORK/trap/drill.out" && grep -q 'short: public.trap has 0 of 4 rows' "$WORK/trap/drill.out" \
+    && grep -q '::warning::pg_restore reported' "$WORK/trap/drill.out" \
+    && ok "missing rows fail the drill, naming the table; the restore error is a warning" || { bad "trap: wrong reason"; cat "$WORK/trap/drill.out"; }
   grep -q 'Failing row contains' "$WORK/trap/drill.out" && bad "a failed COPY's row reached the log" || ok "no row data in the log"
 fi
 
