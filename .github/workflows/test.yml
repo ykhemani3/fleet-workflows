@@ -1,0 +1,40 @@
+# Runs tests/db-backup.test.sh on the same runner image, client and shell the
+# reusable workflow uses (mawk, bash 5, the apt.postgresql.org client).
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  db-backup:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the reusable workflow's own postgres client
+        run: |
+          ruby -ryaml -e '
+            s = YAML.load_file(ARGV[0])["jobs"]["dump"]["steps"]
+            print s.find { |x| x["name"] == "Install version-matched postgres client" }["run"]
+          ' .github/workflows/db-backup-reusable.yml > "$RUNNER_TEMP/install.sh"
+          bash -eo pipefail "$RUNNER_TEMP/install.sh"
+
+      - name: Test
+        run: tests/db-backup.test.sh

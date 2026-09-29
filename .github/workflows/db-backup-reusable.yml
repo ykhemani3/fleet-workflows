@@ -1,7 +1,9 @@
 # Reusable nightly pg_dump — one implementation for the whole fleet (D1).
 # Callers keep their own cron schedule + secret; this file owns the HOW:
-# version-matched client, custom-format dump, empty-dump guard, integrity
-# check, artifact upload. Introduced by the 2026-08 fleet review (OPS-3/6).
+# version-matched client, custom-format dump, content guard
+# (tables + rows), integrity check, artifact upload. Introduced by the
+# 2026-08 fleet review (OPS-3/6).
+# Every input except app_id has a default, so existing callers keep working.
 name: DB Backup (reusable)
 
 on:
@@ -15,6 +17,14 @@ on:
         description: Short app name used in the artifact name
         type: string
         required: true
+      min_tables:
+        description: Fail when the dump holds fewer tables than this
+        type: number
+        default: 1
+      min_rows:
+        description: Fail when the dump holds fewer rows than this, not counting migration-bookkeeping tables
+        type: number
+        default: 1
     secrets:
       DATABASE_URL_DIRECT:
         required: true
@@ -22,6 +32,9 @@ on:
 jobs:
   dump:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install version-matched postgres client
         run: |
@@ -43,16 +56,43 @@ jobs:
         env:
           DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
 
-      - name: Guard against empty dumps + integrity check
+      # A wiped database still dumps to tens or hundreds of KB (its schema is
+      # all still there), so size proves nothing: count what is inside instead.
+      # Reading every COPY block also decompresses every data block — a far
+      # stronger integrity check than listing the table of contents.
+      - name: Content guard + integrity check
         run: |
-          SIZE=$(stat -c%s dump.dump)
-          echo "dump size: $SIZE bytes"
-          if [ "$SIZE" -lt 10240 ]; then
-            echo "::error::Dump suspiciously small ($SIZE bytes) — refusing to upload a useless backup"
+          set -euo pipefail
+          pg_restore --list dump.dump > toc.txt
+          tables=$(awk '$4 == "TABLE" && $5 != "DATA" && $5 != "ATTACH" { n++ } END { print n + 0 }' toc.txt)
+          # rows.txt: "<rows> <schema.table>", one line per table with data.
+          pg_restore --data-only --file=- dump.dump | awk '
+            !copying && /^COPY / { copying = 1; table = $2; rows = 0; next }
+            copying && $0 == "\\." { print rows, table; copying = 0; next }
+            copying { rows++ }
+          ' > rows.txt
+          total=$(awk '{ n += $1 } END { print n + 0 }' rows.txt)
+          # A reset re-applies the migrations, which refills these tables, so
+          # they do not count towards min_rows.
+          counted=$(awk '{ t = $2; sub(/^.*\./, "", t); gsub(/"/, "", t) }
+            t !~ /^(_prisma_migrations|schema_migrations|migrations)$/ { n += $1 }
+            END { print n + 0 }' rows.txt)
+          echo "dump: $(wc -c < dump.dump | tr -d ' ') bytes, $tables tables, $total rows ($counted outside migration bookkeeping)"
+          echo "::group::rows per table"
+          sort -nr rows.txt
+          echo "::endgroup::"
+          if [ "$tables" -lt "$MIN_TABLES" ]; then
+            echo "::error::Dump holds $tables tables, fewer than min_tables=$MIN_TABLES — refusing to upload it as a good backup"
             exit 1
           fi
-          pg_restore --list dump.dump > /dev/null
-          echo "integrity check passed"
+          if [ "$counted" -lt "$MIN_ROWS" ]; then
+            echo "::error::Dump holds $counted rows outside migration bookkeeping, fewer than min_rows=$MIN_ROWS — refusing to upload it as a good backup"
+            exit 1
+          fi
+          echo "content guard passed"
+        env:
+          MIN_TABLES: ${{ inputs.min_tables }}
+          MIN_ROWS: ${{ inputs.min_rows }}
 
       - name: Upload dump as artifact
         uses: actions/upload-artifact@v4
@@ -60,3 +100,4 @@ jobs:
           name: ${{ inputs.app_id }}-db-${{ github.run_id }}
           path: dump.dump
           retention-days: ${{ inputs.retention_days }}
+
