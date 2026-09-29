@@ -26,6 +26,7 @@ jobs:
 | `compression` | `zstd:level=9,long` | `pg_dump --compress` spec |
 | `min_tables` | `1` | Fail when the dump holds fewer tables |
 | `min_rows` | `1` | Fail when the dump holds fewer rows, not counting `_prisma_migrations`, `schema_migrations` or `migrations` tables |
+| `max_row_drop_pct` | `50` | Fail when the rows `min_rows` counts fell by more than this percent since the last good backup; `100` turns the check off |
 | `check_schema` | `''` | Count, and restore-drill, only this schema (empty = every schema) |
 | `restore_drill` | `false` | Also restore the dump into a scratch postgres and check it |
 
@@ -34,12 +35,29 @@ because its schema is all still there, so the size of a dump proves nothing.
 The guard counts the tables in the dump's table of contents and the rows in
 its COPY blocks, and refuses to upload a dump below `min_tables` or
 `min_rows`. The migration-bookkeeping tables are left out of the row count
-because a reset refills them. The defaults only catch a database with no
-tables or no rows; set floors near your real counts (the run log lists the
-rows per table) to catch a partial loss. On Supabase set `check_schema:
-public`: the dump also carries auth, storage and the platform's other
-schemas, which a wipe of public leaves full. Reading the COPY blocks also
-decompresses every data block, so a corrupt dump fails here too.
+because a reset refills them, but that alone does not catch a reset:
+migrations and seed scripts put rows back in ordinary tables too (a settings
+row, digest recipients, a first user), so a reset database still clears
+`min_rows: 1`. Two checks catch it:
+
+- **Drop check.** The guard compares the count with the last good backup's,
+  kept in the caller repo's Actions cache (a few bytes; the cache is not
+  artifact storage), and fails on a drop of more than `max_row_drop_pct`.
+  The baseline moves only when the guard passes, so a wiped database keeps
+  failing night after night. It is skipped when there is no baseline: the
+  first run, the first after 7 days without a run (GitHub evicts unused
+  caches), or the first after `check_schema` changes. If a big drop was intended (a purge), delete
+  that repo's `db-backup-rows:<app_id>:` caches (Actions → Caches, or
+  `gh cache delete --all -R <owner>/<repo>`, which only costs other caches a
+  rebuild); the next run sets a new baseline.
+- **Floors.** Set `min_rows` near your real count (the run log lists the rows
+  per table). It needs no history, and it also catches a partial loss the
+  drop check lets through.
+
+On Supabase set `check_schema: public`: the dump also carries auth, storage
+and the platform's other schemas, which a wipe of public leaves full.
+Reading the COPY blocks also decompresses every data block, so a corrupt
+dump fails here too.
 
 **Restore drill.** With `restore_drill: true`, after the upload the job
 starts `postgres:<major>` (the major version the dump came from), restores

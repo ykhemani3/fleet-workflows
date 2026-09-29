@@ -66,6 +66,16 @@ ruby -ryaml -e '
 ' "$WF" && ok "every new input has a default; no expressions inside run: scripts" || bad "input contract"
 [ "$(input_default retention_days)" = "7" ] && ok "retention_days defaults to 7" || bad "retention_days default"
 [ "$(input_default restore_drill)" = "false" ] && ok "restore drill is opt-in" || bad "restore_drill default"
+ruby -ryaml -e '
+  steps = YAML.load_file(ARGV[0])["jobs"]["dump"]["steps"]
+  at = ->(n) { steps.index { |s| s["name"] == n } or abort("no step named #{n}") }
+  r, g, s, u = ["Restore the last good row count", "Content guard + integrity check",
+                "Save this row count as the last good one", "Upload dump as artifact"].map(&at)
+  abort("order: restore, guard, save, upload") unless r < g && g < s && s < u
+  rw, sw = steps[r]["with"], steps[s]["with"]
+  abort("restore and save must use one file and one key") unless rw["path"] == "rows-last-good.txt" && sw["path"] == rw["path"] && sw["key"] == rw["key"]
+  abort("restore-keys must be the key up to the run id") unless rw["key"].start_with?(rw["restore-keys"]) && rw["restore-keys"].end_with?(":")
+' "$WF" && ok "the baseline is restored before the guard and saved only after it passes" || bad "baseline cache steps"
 
 echo "== fixtures"
 make_db() { createdb "${PREFIX}_$1" && psql -X -q -v ON_ERROR_STOP=1 -d "${PREFIX}_$1"; }
@@ -86,9 +96,12 @@ create table "Odd Name" (id int);
 insert into "Odd Name" values (1), (2);
 insert into app.item values (1, E'two\nlines'), (2, E'back\\\\slash'), (3, E'tab\there'), (4, '\.');
 SQL
-# What a migrate reset leaves: every table, only the migrations rows.
+# What a migrate reset leaves: every table, the migrations rows, and the row a
+# migration or seed script puts back (as in dispatch-planner, gatepass,
+# slpl-production, attendance and nail-loft-inventory).
 make_db reset <<SQL || exit 1
 $SCHEMA_SQL
+insert into "User" (name) values ('seeded admin');
 SQL
 # public wiped, another schema untouched: Supabase after a reset of public.
 make_db half <<SQL || exit 1
@@ -116,21 +129,42 @@ done
 [ "$dumped" -eq 5 ] && ok "dumped with the default compression ($COMPRESSION)" || { echo "cannot test without dumps"; exit 1; }
 
 echo "== content guard"
-guard() { # dir min_tables min_rows [check_schema]
-  run_step "$WORK/$1" guard MIN_TABLES="$2" MIN_ROWS="$3" CHECK_SCHEMA="${4:-}" > "$WORK/$1/guard.out" 2>&1
+MAX_DROP=$(input_default max_row_drop_pct)
+# No last good backup unless LAST_GOOD holds one ("<rows>TAB<check_schema>").
+guard() { # dir min_tables min_rows [check_schema [max_row_drop_pct]]
+  rm -f "$WORK/$1/rows-last-good.txt"
+  [ -z "${LAST_GOOD:-}" ] || printf '%s\n' "$LAST_GOOD" > "$WORK/$1/rows-last-good.txt"
+  run_step "$WORK/$1" guard MIN_TABLES="$2" MIN_ROWS="$3" CHECK_SCHEMA="${4:-}" MAX_ROW_DROP_PCT="${5:-$MAX_DROP}" \
+    > "$WORK/$1/guard.out" 2>&1
 }
+baseline() { cat "$WORK/$1/rows-last-good.txt" 2>/dev/null; }
+TAB=$(printf '\t')
 if guard full 1 1; then
   grep -q '7 tables, 16 rows (13 outside migration bookkeeping)' "$WORK/full/guard.out" \
     && ok "healthy dump passes and is counted exactly (partitions, escapes, a lone \\., a quoted name)" \
     || { bad "healthy dump counts"; cat "$WORK/full/guard.out"; }
 else bad "healthy dump refused"; cat "$WORK/full/guard.out"; fi
+[ "$(baseline full)" = "13$TAB" ] && ok "a passing guard records its count as the last good one" || bad "baseline written: '$(baseline full)'"
 guard full 7 13 && ok "passes at exactly min_tables=7, min_rows=13" || bad "boundary refused"
 guard full 8 1 && bad "min_tables=8 let a 7-table dump through" \
   || { grep -q '7 tables, fewer than min_tables=8' "$WORK/full/guard.out" && ok "min_tables above the dump fails" || bad "min_tables: wrong reason"; }
 guard full 1 14 && bad "min_rows=14 let a 13-row dump through" \
   || { grep -q '13 rows outside migration bookkeeping, fewer than min_rows=14' "$WORK/full/guard.out" && ok "min_rows above the dump fails" || bad "min_rows: wrong reason"; }
-guard reset 1 1 && bad "a reset database (schema + migrations only) passed" \
-  || { grep -q 'fewer than min_rows=1' "$WORK/reset/guard.out" && ok "a reset database fails at the default thresholds" || bad "reset: wrong reason"; }
+guard reset 1 1 && ok "limit: with no last good backup, a seeded reset clears min_rows=1" \
+  || { bad "seeded reset: expected to pass min_rows=1"; cat "$WORK/reset/guard.out"; }
+guard reset 1 2 && bad "min_rows=2 let a seeded reset through" \
+  || { grep -q '1 rows outside migration bookkeeping, fewer than min_rows=2' "$WORK/reset/guard.out" \
+       && ok "a floor above the seed rows catches a seeded reset" || bad "seeded reset: wrong reason"; }
+LAST_GOOD="13$TAB" guard reset 1 1 && bad "a seeded reset passed against yesterday's 13 rows" \
+  || { grep -q '1 rows outside migration bookkeeping, down more than max_row_drop_pct=50% from 13' "$WORK/reset/guard.out" \
+       && ok "a seeded reset fails at the defaults against the last good backup" || { bad "drop: wrong reason"; cat "$WORK/reset/guard.out"; }; }
+[ "$(baseline reset)" = "13$TAB" ] && ok "a failed guard leaves the last good count where it was" || bad "baseline moved on failure: '$(baseline reset)'"
+LAST_GOOD="26$TAB" guard full 1 1 && ok "passes at exactly a 50% drop" || bad "50% drop refused"
+LAST_GOOD="27$TAB" guard full 1 1 && bad "a drop past 50% passed" \
+  || { grep -q 'from 27 at the last good backup' "$WORK/full/guard.out" && ok "a drop past 50% fails" || bad "27: wrong reason"; }
+LAST_GOOD="1000$TAB" guard full 1 1 "" 100 && ok "max_row_drop_pct=100 turns the drop check off" || bad "pct=100 still refused"
+LAST_GOOD="1000${TAB}public" guard full 1 1 && [ "$(baseline full)" = "13$TAB" ] \
+  && ok "a baseline from another check_schema is ignored and replaced" || bad "scope mismatch: '$(baseline full)'"
 guard half 1 1 && ok "public wiped, app intact: passes when every schema counts" || bad "half: refused unscoped"
 guard half 1 1 public && bad "check_schema=public let a wiped public through" \
   || { grep -q '0 rows outside migration bookkeeping, fewer than min_rows=1' "$WORK/half/guard.out" \

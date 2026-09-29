@@ -29,6 +29,10 @@ on:
         description: Fail when the dump holds fewer rows than this, not counting migration-bookkeeping tables
         type: number
         default: 1
+      max_row_drop_pct:
+        description: Fail when the rows min_rows counts fell by more than this percent since the last good backup; 100 turns the check off
+        type: number
+        default: 50
       check_schema:
         description: Count (and restore-drill) only this schema, e.g. public on Supabase; empty = every schema
         type: string
@@ -70,6 +74,15 @@ jobs:
           DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
           COMPRESSION: ${{ inputs.compression }}
 
+      # The last good backup's row count, for the guard's drop check. It sits
+      # in the caller repo's Actions cache, which is not artifact storage.
+      - name: Restore the last good row count
+        uses: actions/cache/restore@v4
+        with:
+          path: rows-last-good.txt
+          key: 'db-backup-rows:${{ inputs.app_id }}:${{ github.run_id }}-${{ github.run_attempt }}'
+          restore-keys: 'db-backup-rows:${{ inputs.app_id }}:'
+
       # A wiped database still dumps to tens or hundreds of KB (its schema is
       # all still there), so size proves nothing: count what is inside instead.
       # Reading every COPY block also decompresses every data block — a far
@@ -99,7 +112,10 @@ jobs:
           tables=$(cat tables.txt)
           total=$(awk -F '\t' '{ n += $1 } END { print n + 0 }' rows-checked.txt)
           # A reset re-applies the migrations, which refills these tables, so
-          # they do not count towards min_rows.
+          # they do not count towards min_rows. That alone does not catch a
+          # reset: migrations and seed scripts put rows back in ordinary tables
+          # too, so a reset database clears a low min_rows. The drop check
+          # below, and min_rows set near the real count, catch it.
           counted=$(awk -F '\t' '{ t = $2; sub(/^.*\./, "", t); gsub(/"/, "", t) }
             t !~ /^(_prisma_migrations|schema_migrations|migrations)$/ { n += $1 }
             END { print n + 0 }' rows-checked.txt)
@@ -115,11 +131,33 @@ jobs:
             echo "::error::Dump holds $counted rows outside migration bookkeeping, fewer than min_rows=$MIN_ROWS — refusing to upload it as a good backup"
             exit 1
           fi
+          # rows-last-good.txt: "<rows>TAB<check_schema>" from the last run that
+          # passed. It moves only when the guard passes, so a wiped database
+          # keeps failing night after night. A baseline counted over another
+          # scope is ignored, and replaced below.
+          last=$(awk -F '\t' -v s="$CHECK_SCHEMA" 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 == s { print $1 }' rows-last-good.txt 2>/dev/null || true)
+          if [ -n "$last" ]; then
+            echo "last good backup: $last rows outside migration bookkeeping"
+            if awk -v c="$counted" -v l="$last" -v p="$MAX_ROW_DROP_PCT" 'BEGIN { exit !(c * 100 < l * (100 - p)) }'; then
+              echo "::error::Dump holds $counted rows outside migration bookkeeping, down more than max_row_drop_pct=$MAX_ROW_DROP_PCT% from $last at the last good backup — refusing to upload it as a good backup"
+              exit 1
+            fi
+          else
+            echo "no last good backup to compare with (first run, cache evicted, or check_schema changed)"
+          fi
+          printf '%s\t%s\n' "$counted" "$CHECK_SCHEMA" > rows-last-good.txt
           echo "content guard passed"
         env:
           MIN_TABLES: ${{ inputs.min_tables }}
           MIN_ROWS: ${{ inputs.min_rows }}
+          MAX_ROW_DROP_PCT: ${{ inputs.max_row_drop_pct }}
           CHECK_SCHEMA: ${{ inputs.check_schema }}
+
+      - name: Save this row count as the last good one
+        uses: actions/cache/save@v4
+        with:
+          path: rows-last-good.txt
+          key: 'db-backup-rows:${{ inputs.app_id }}:${{ github.run_id }}-${{ github.run_attempt }}'
 
       - name: Upload dump as artifact
         uses: actions/upload-artifact@v4
