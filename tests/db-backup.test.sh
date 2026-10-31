@@ -66,6 +66,7 @@ ruby -ryaml -e '
 ' "$WF" && ok "every new input has a default; no expressions inside run: scripts" || bad "input contract"
 [ "$(input_default retention_days)" = "7" ] && ok "retention_days defaults to 7" || bad "retention_days default"
 [ "$(input_default restore_drill)" = "false" ] && ok "restore drill is opt-in" || bad "restore_drill default"
+[ -z "$(input_default exclude_table_data)" ] && ok "exclude_table_data defaults to empty" || bad "exclude_table_data default"
 ruby -ryaml -e '
   steps = YAML.load_file(ARGV[0])["jobs"]["dump"]["steps"]
   at = ->(n) { steps.index { |s| s["name"] == n } or abort("no step named #{n}") }
@@ -210,6 +211,44 @@ else
     && ok "missing rows fail the drill, naming the table; the restore error is a warning" || { bad "trap: wrong reason"; cat "$WORK/trap/drill.out"; }
   grep -q 'Failing row contains' "$WORK/trap/drill.out" && bad "a failed COPY's row reached the log" || ok "no row data in the log"
 fi
+
+echo "== exclude_table_data"
+# Spaces and newlines both separate patterns; a quoted name keeps its case and
+# * is the wildcard (public.ev* is the partitioned parent and its partition).
+mkdir -p "$WORK/excl"
+if run_step "$WORK/excl" dump COMPRESSION="$COMPRESSION" DATABASE_URL_DIRECT="${PREFIX}_full" \
+     EXCLUDE_TABLE_DATA="$(printf 'public."User"\n  app.item public.ev*  ')" > "$WORK/excl/dump.out" 2>&1; then
+  ok "dumped with three exclude patterns"
+else bad "exclude dump failed"; cat "$WORK/excl/dump.out"; fi
+grep -q '::warning' "$WORK/excl/dump.out" && bad "a matching pattern was warned about" || ok "no warning when every pattern matches"
+pg_restore --data-only --file=- "$WORK/excl/dump.dump" 2>/dev/null | grep -q -e 'user 1' -e 'two' \
+  && bad "an excluded table's rows reached the dump" || ok "the excluded tables' rows are not in the dump"
+pg_restore --list "$WORK/excl/dump.dump" 2>/dev/null | grep -q ' TABLE public User ' \
+  && ok "an excluded table itself stays in the dump" || bad "the excluded table went missing"
+guard excl 1 1 && grep -q '7 tables, 5 rows (2 outside migration bookkeeping)' "$WORK/excl/guard.out" \
+  && ok "the guard counts the tables, and only the rows kept" || { bad "guard over an exclude dump"; cat "$WORK/excl/guard.out"; }
+if drill excl; then
+  grep -q 'restore drill: 7 of 7 tables, 5 of 5 rows' "$WORK/excl/drill.out" \
+    && ok "the drill restores every table, the excluded ones empty" || { bad "exclude drill counts"; cat "$WORK/excl/drill.out"; }
+else bad "exclude restore drill failed"; cat "$WORK/excl/drill.out"; fi
+run_step "$WORK/excl" dump COMPRESSION="$COMPRESSION" DATABASE_URL_DIRECT="${PREFIX}_full" \
+  EXCLUDE_TABLE_DATA="public.nosuch" > "$WORK/excl/nosuch.out" 2>&1 \
+  && grep -q '::warning::exclude_table_data: public.nosuch matches no table' "$WORK/excl/nosuch.out" \
+  && ok "a pattern that matches nothing is warned about, not fatal" || { bad "no-match pattern"; cat "$WORK/excl/nosuch.out"; }
+# Refused before pg_dump runs: no dump file, nothing executed.
+refused=0
+for p in 'public.User' 'User' '*' 'public.' '.x' 'a.b.c' '--file=x.y' '-fx.y' \
+         'public.x;touch${IFS}PWNED' 'public.$(touch${IFS}PWNED)' 'public.`touch${IFS}PWNED`' \
+         "public.x'" 'public."a b"' 'public."x"y' 'public.x\y' 'public.x|y' 'public.x?' 'public.é'; do
+  rm -rf "$WORK/bad"; mkdir -p "$WORK/bad"
+  if run_step "$WORK/bad" dump COMPRESSION="$COMPRESSION" DATABASE_URL_DIRECT="${PREFIX}_full" \
+       EXCLUDE_TABLE_DATA="ok_s.ok_t $p" > "$WORK/bad/out" 2>&1 \
+     || [ -e "$WORK/bad/dump.dump" ] || ! grep -q '::error::exclude_table_data:' "$WORK/bad/out"; then
+    bad "pattern not refused: $p"; cat "$WORK/bad/out"
+  else refused=$((refused + 1)); fi
+  [ -e "$WORK/bad/PWNED" ] && bad "a pattern ran a command: $p"
+done
+[ "$refused" -eq 18 ] && ok "18 unsafe or unmatched-case patterns refused before pg_dump" || bad "only $refused of 18 refused"
 
 echo "== $pass passed, $failed failed"
 [ "$failed" -eq 0 ]

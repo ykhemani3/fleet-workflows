@@ -41,6 +41,10 @@ on:
         description: Also restore the dump into a scratch postgres of the same major version and check its tables and rows
         type: boolean
         default: false
+      exclude_table_data:
+        description: 'Tables dumped without their rows (pg_dump --exclude-table-data), as schema.table patterns separated by spaces or newlines; quote a mixed-case name, e.g. ask_private.key public."AskLog"; empty = every table keeps its rows'
+        type: string
+        default: ''
     secrets:
       DATABASE_URL_DIRECT:
         required: true
@@ -65,14 +69,39 @@ jobs:
 
       - name: Dump
         run: |
+          # exclude_table_data: each pattern keeps its table in the dump and
+          # leaves its rows out. Only schema.table made of lower-case names,
+          # digits, _ and the * wildcard, or a "Quoted" name, is accepted, and
+          # each goes to pg_dump as one argument (never through a shell or SQL).
+          # An unquoted upper-case letter is refused: pg_dump folds it to lower
+          # case, so the pattern would match nothing and the rows would stay.
+          part='([a-z0-9_*]+|"[A-Za-z0-9_]+")'
+          re="^$part\\.$part\$"
+          excl=()
+          set -f # * is pg_dump's wildcard, not a file glob
+          for p in $EXCLUDE_TABLE_DATA; do
+            if ! [[ $p =~ $re ]]; then
+              echo "::error::exclude_table_data: '$p' is not schema.table (lower-case names, digits, _ and *, or a \"Quoted\" name)"
+              exit 1
+            fi
+            excl+=("--exclude-table-data=$p")
+            echo "rows left out of the dump: $p"
+            # pg_dump ignores a pattern that matches nothing; say so.
+            if [ -z "$(psql -X -At -d "$DATABASE_URL_DIRECT" -c "\\dt $p" 2> /dev/null)" ]; then
+              echo "::warning::exclude_table_data: $p matches no table"
+            fi
+          done
+          set +f
           pg_dump --no-owner --no-privileges \
                   --format=custom \
                   --compress="$COMPRESSION" \
+                  "${excl[@]}" \
                   --file "dump.dump" \
                   "$DATABASE_URL_DIRECT"
         env:
           DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
           COMPRESSION: ${{ inputs.compression }}
+          EXCLUDE_TABLE_DATA: ${{ inputs.exclude_table_data }}
 
       # The last good backup's row count, for the guard's drop check. It sits
       # in the caller repo's Actions cache, which is not artifact storage.

@@ -29,6 +29,7 @@ jobs:
 | `max_row_drop_pct` | `50` | Fail when the rows `min_rows` counts fell by more than this percent since the last good backup; `100` turns the check off |
 | `check_schema` | `''` | Count, and restore-drill, only this schema (empty = every schema) |
 | `restore_drill` | `false` | Also restore the dump into a scratch postgres and check it |
+| `exclude_table_data` | `''` | Tables dumped without their rows (`pg_dump --exclude-table-data`), as `schema.table` patterns separated by spaces or newlines |
 
 **Content guard.** A wiped database still dumps to tens or hundreds of KB,
 because its schema is all still there, so the size of a dump proves nothing.
@@ -58,6 +59,26 @@ On Supabase set `check_schema: public`: the dump also carries auth, storage
 and the platform's other schemas, which a wipe of public leaves full.
 Reading the COPY blocks also decompresses every data block, so a corrupt
 dump fails here too.
+
+**Leaving rows out.** `exclude_table_data` keeps a table in the dump (its
+definition restores) but leaves its rows out — for data that must not sit in
+an Actions artifact, such as a signing key or chat text:
+
+```yaml
+    with:
+      app_id: myapp
+      exclude_table_data: ask_private.key public."AskLog"
+```
+
+Each pattern must be `schema.table`, made of lower-case names, digits, `_`
+and the `*` wildcard, or a double-quoted name for a mixed-case table
+(`public."AskLog"`); anything else fails the run before pg_dump starts. An
+unquoted capital is refused because pg_dump folds it to lower case, so the
+pattern would match nothing and the rows would stay in. A pattern that
+matches no table only warns (the table may not exist yet). The guard and the
+drill count only the rows kept, so the first run with a new exclusion drops
+the row count by that table's rows: if that is over `max_row_drop_pct`,
+reset the baseline as the drop check above says.
 
 **Restore drill.** With `restore_drill: true`, after the upload the job
 starts `postgres:<major>` (the major version the dump came from), restores
