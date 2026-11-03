@@ -2,7 +2,8 @@
 # Runs db-backup-reusable.yml's own step scripts (extracted verbatim from the
 # YAML) against throwaway local databases, so the guard and the restore drill
 # are tested as shipped. Needs: a reachable postgres whose role may create
-# databases (PG* env vars, or the local socket), a v17 client on PATH, ruby.
+# databases (PG* env vars, or the local socket), a v17 client on PATH, ruby,
+# and age.
 #
 #   PATH=/opt/homebrew/opt/postgresql@17/bin:$PATH tests/db-backup.test.sh
 #
@@ -46,6 +47,8 @@ step "Dump" > "$WORK/dump.sh" || exit 1
 step "Content guard + integrity check" > "$WORK/guard.sh" || exit 1
 step "Start scratch postgres for the restore drill" > "$WORK/start.sh" || exit 1
 step "Restore drill" > "$WORK/drill.sh" || exit 1
+step "Check the encryption recipient" > "$WORK/recipient.sh" || exit 1
+step "Encrypt dump" > "$WORK/encrypt.sh" || exit 1
 
 # Runs a step script the way GitHub runs `shell: bash`, in its own work dir.
 run_step() { # dir script [VAR=value ...]
@@ -60,12 +63,26 @@ ruby -ryaml -e '
   abort("inputs without a default: #{bad.join(", ")}") unless bad.empty?
   abort("app_id must stay required") unless wc["inputs"]["app_id"]["required"]
   abort("retention_days must stay an input") unless wc["inputs"].key?("retention_days")
-  abort("DATABASE_URL_DIRECT must stay the only secret") unless wc["secrets"].keys == ["DATABASE_URL_DIRECT"]
+  abort("DATABASE_URL_DIRECT must stay the only required secret") unless
+    wc["secrets"]["DATABASE_URL_DIRECT"]["required"] == true &&
+    wc["secrets"].all? { |k, v| k == "DATABASE_URL_DIRECT" || v["required"] == false }
   runs = w["jobs"]["dump"]["steps"].map { |s| s["run"].to_s }.join
   abort("a run: script uses a ${{ }} expression; pass it through env:") if runs.include?("${{")
 ' "$WF" && ok "every new input has a default; no expressions inside run: scripts" || bad "input contract"
 [ "$(input_default retention_days)" = "7" ] && ok "retention_days defaults to 7" || bad "retention_days default"
 [ "$(input_default restore_drill)" = "false" ] && ok "restore drill is opt-in" || bad "restore_drill default"
+[ "$(input_default encrypt)" = "false" ] && ok "encryption is opt-in" || bad "encrypt default"
+ruby -ryaml -e '
+  steps = YAML.load_file(ARGV[0])["jobs"]["dump"]["steps"]
+  at = ->(n) { steps.index { |s| s["name"] == n } or abort("no step named #{n}") }
+  c, d, g, e, sv, u = ["Check the encryption recipient", "Dump", "Content guard + integrity check", "Encrypt dump",
+                       "Save this row count as the last good one", "Upload dump as artifact"].map(&at)
+  abort("order: check recipient, dump, guard, encrypt, save, upload") unless c < d && d < g && g < e && e < sv && sv < u
+  abort("check and encrypt run only when encrypt is set") unless [c, e].all? { |i| steps[i]["if"] == "inputs.encrypt" }
+  abort("encrypt=true must upload only dump.dump.age") unless
+    steps[u]["with"]["path"] == "${{ inputs.encrypt && \x27dump.dump.age\x27 || \x27dump.dump\x27 }}" &&
+    steps[u]["with"]["if-no-files-found"] == "error"
+' "$WF" && ok "the recipient is checked before the dump; encrypt=true uploads only the .age file" || bad "encryption steps"
 [ -z "$(input_default exclude_table_data)" ] && ok "exclude_table_data defaults to empty" || bad "exclude_table_data default"
 ruby -ryaml -e '
   steps = YAML.load_file(ARGV[0])["jobs"]["dump"]["steps"]
@@ -178,6 +195,36 @@ mkdir -p "$WORK/cut"
 size=$(wc -c < "$WORK/full/dump.dump")
 head -c $((size * 3 / 4)) "$WORK/full/dump.dump" > "$WORK/cut/dump.dump"
 guard cut 1 1 && bad "a truncated dump passed" || ok "a truncated dump fails"
+
+echo "== encryption"
+if command -v age > /dev/null && command -v age-keygen > /dev/null; then
+  age-keygen -o "$WORK/key.txt" 2> /dev/null
+  pub=$(age-keygen -y "$WORK/key.txt")
+  age-keygen -o "$WORK/key2.txt" 2> /dev/null
+  pub2=$(age-keygen -y "$WORK/key2.txt")
+  recipient() { run_step "$WORK/full" recipient BACKUP_AGE_RECIPIENT="$1" > "$WORK/recipient.out" 2>&1; }
+  recipient "" && bad "a missing recipient passed" \
+    || { grep -q 'missing or empty - refusing to back up unencrypted' "$WORK/recipient.out" && ok "a missing recipient fails loudly" || bad "missing recipient: wrong reason"; }
+  recipient "   " && bad "a blank recipient passed" || ok "a blank recipient fails"
+  recipient "AGE-SECRET-KEY-1QQQ" && bad "a private key passed as the recipient" \
+    || { grep -q 'not an age public key' "$WORK/recipient.out" && ! grep -q 'AGE-SECRET' "$WORK/recipient.out" \
+         && ok "a private key is refused, and not echoed" || bad "private key: wrong reason or echoed"; }
+  recipient "${pub}x" && bad "a malformed key passed" || ok "a malformed key fails"
+  recipient "$pub" && ok "one age public key passes" || { bad "a good key refused"; cat "$WORK/recipient.out"; }
+  recipient "$pub
+$pub2" && grep -q 'to 2 age recipient' "$WORK/recipient.out" && ok "two keys on two lines pass" || bad "two keys refused"
+  rm -f "$WORK/full/dump.dump.age"
+  if run_step "$WORK/full" encrypt BACKUP_AGE_RECIPIENT="$pub $pub2" > "$WORK/encrypt.out" 2>&1; then
+    age -d -i "$WORK/key.txt" -o "$WORK/decrypted.dump" "$WORK/full/dump.dump.age" \
+      && cmp -s "$WORK/decrypted.dump" "$WORK/full/dump.dump" \
+      && ok "the .age file decrypts to the very dump" || bad "decrypt round trip"
+    age -d -i "$WORK/key2.txt" "$WORK/full/dump.dump.age" | cmp -s - "$WORK/full/dump.dump" \
+      && ok "either recipient's key decrypts it" || bad "second recipient cannot decrypt"
+    grep -q 'PGDMP' "$WORK/full/dump.dump.age" && bad "plaintext dump header inside the .age file" || ok "no plaintext in the .age file"
+  else bad "encrypt step failed"; cat "$WORK/encrypt.out"; fi
+else
+  bad "age and age-keygen must be on PATH (brew install age / apt-get install age)"
+fi
 
 echo "== restore drill"
 # The start step, with docker stubbed: it must ask for the dump's own major.

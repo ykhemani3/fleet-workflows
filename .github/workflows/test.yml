@@ -36,6 +36,7 @@ jobs:
             print s.find { |x| x["name"] == "Install version-matched postgres client" }["run"]
           ' .github/workflows/db-backup-reusable.yml > "$RUNNER_TEMP/install.sh"
           bash -eo pipefail "$RUNNER_TEMP/install.sh"
+          sudo apt-get install -yqq age
 
       - name: Test
         run: tests/db-backup.test.sh

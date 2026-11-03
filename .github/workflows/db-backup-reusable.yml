@@ -2,7 +2,8 @@
 # Callers keep their own cron schedule + secret; this file owns the HOW:
 # version-matched client, compressed custom-format dump, content guard
 # (tables + rows), integrity check, artifact upload, and an opt-in restore
-# drill. Introduced by the 2026-08 fleet review (OPS-3/6).
+# drill, and opt-in age encryption of the uploaded dump. Introduced by the
+# 2026-08 fleet review (OPS-3/6).
 # Every input except app_id has a default, so existing callers keep working.
 name: DB Backup (reusable)
 
@@ -45,9 +46,16 @@ on:
         description: 'Tables dumped without their rows (pg_dump --exclude-table-data), as schema.table patterns separated by spaces or newlines; quote a mixed-case name, e.g. ask_private.key public."AskLog"; empty = every table keeps its rows'
         type: string
         default: ''
+      encrypt:
+        description: Encrypt the dump with age to the BACKUP_AGE_RECIPIENT secret before upload, and upload only the encrypted file; the job fails if that secret is missing or malformed
+        type: boolean
+        default: false
     secrets:
       DATABASE_URL_DIRECT:
         required: true
+      BACKUP_AGE_RECIPIENT:
+        description: One or more age public keys (age1...), separated by spaces or newlines; needed when encrypt is true. Only public keys - the private key never comes near GitHub
+        required: false
 
 jobs:
   dump:
@@ -56,6 +64,32 @@ jobs:
       run:
         shell: bash
     steps:
+      # First, so a missing recipient fails the run before the database is
+      # read: an encrypting caller never gets a plaintext dump uploaded.
+      - name: Check the encryption recipient
+        if: inputs.encrypt
+        run: |
+          # Bech32 after age1: 58 characters, no 1, b, i or o.
+          re='^age1[02-9ac-hj-np-z]{58}$'
+          n=0
+          for r in $BACKUP_AGE_RECIPIENT; do
+            if ! [[ $r =~ $re ]]; then
+              echo "::error::BACKUP_AGE_RECIPIENT holds something that is not an age public key (age1 followed by 58 characters)"
+              exit 1
+            fi
+            n=$((n + 1))
+          done
+          if [ "$n" -eq 0 ]; then
+            echo "::error::encrypt is true but the BACKUP_AGE_RECIPIENT secret is missing or empty - refusing to back up unencrypted"
+            exit 1
+          fi
+          echo "encrypting to $n age recipient(s)"
+          # Installed now, before the database is read, so an apt failure
+          # cannot cost a dump already taken. Ubuntu's own package.
+          command -v age > /dev/null || { sudo apt-get update -qq && sudo apt-get install -yqq age; }
+        env:
+          BACKUP_AGE_RECIPIENT: ${{ secrets.BACKUP_AGE_RECIPIENT }}
+
       - name: Install version-matched postgres client
         run: |
           # apt-key is gone from apt >= 3.0 — use signed-by keyring.
@@ -182,6 +216,25 @@ jobs:
           MAX_ROW_DROP_PCT: ${{ inputs.max_row_drop_pct }}
           CHECK_SCHEMA: ${{ inputs.check_schema }}
 
+      # Only dump.dump.age is uploaded when encrypt is true (the upload path
+      # below is chosen by the input, not by which file exists), so a failure
+      # here fails the night's backup rather than uploading the plaintext.
+      # The plaintext stays on the runner for the restore drill.
+      - name: Encrypt dump
+        if: inputs.encrypt
+        run: |
+          set -euo pipefail
+          args=()
+          for r in $BACKUP_AGE_RECIPIENT; do args+=(-r "$r"); done
+          age "${args[@]}" -o dump.dump.age dump.dump
+          if [ "$(head -c 21 dump.dump.age)" != "age-encryption.org/v1" ]; then
+            echo "::error::dump.dump.age is not an age file"
+            exit 1
+          fi
+          echo "encrypted: $(wc -c < dump.dump.age | tr -d ' ') bytes"
+        env:
+          BACKUP_AGE_RECIPIENT: ${{ secrets.BACKUP_AGE_RECIPIENT }}
+
       - name: Save this row count as the last good one
         uses: actions/cache/save@v4
         with:
@@ -192,7 +245,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.app_id }}-db-${{ github.run_id }}
-          path: dump.dump
+          path: ${{ inputs.encrypt && 'dump.dump.age' || 'dump.dump' }}
           retention-days: ${{ inputs.retention_days }}
           # The dump is already compressed; zipping it again only costs time.
           compression-level: 0

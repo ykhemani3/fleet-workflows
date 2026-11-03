@@ -30,6 +30,26 @@ jobs:
 | `check_schema` | `''` | Count, and restore-drill, only this schema (empty = every schema) |
 | `restore_drill` | `false` | Also restore the dump into a scratch postgres and check it |
 | `exclude_table_data` | `''` | Tables dumped without their rows (`pg_dump --exclude-table-data`), as `schema.table` patterns separated by spaces or newlines |
+| `encrypt` | `false` | Encrypt the dump with [age](https://age-encryption.org) to the `BACKUP_AGE_RECIPIENT` secret and upload only `dump.dump.age`; fails if the secret is missing or not an age public key |
+
+**Encryption.** With `encrypt: true`, pass the optional secret
+`BACKUP_AGE_RECIPIENT`: one or more age public keys (`age1...`), separated by
+spaces or newlines. It holds public keys only; the private key stays off
+GitHub (for example in the owner's macOS Keychain). The recipient is checked
+first, before the database is read, so a missing or malformed secret fails
+the run and nothing is uploaded. The upload path is chosen by the input, not
+by which file exists, so an encrypting caller never uploads the plaintext
+dump. The plaintext stays on the runner only, for the content guard and the
+restore drill.
+
+```yaml
+    with:
+      app_id: myapp
+      encrypt: true
+    secrets:
+      DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
+      BACKUP_AGE_RECIPIENT: ${{ secrets.BACKUP_AGE_RECIPIENT }}
+```
 
 **Content guard.** A wiped database still dumps to tens or hundreds of KB,
 because its schema is all still there, so the size of a dump proves nothing.
@@ -141,6 +161,14 @@ apt.postgresql.org packages are).
     gh run download <run-id> -R <owner>/<repo>    # a folder holding dump.dump
     createdb scratch
     pg_restore --no-owner --no-privileges -d scratch <app_id>-db-<run-id>/dump.dump
+
+An encrypted artifact holds `dump.dump.age`. Decrypt it with the private key
+(age reads the identity from a file, so pipe it in from wherever it is kept),
+then restore as above:
+
+    gh run download <run-id> -R <owner>/<repo>    # a folder holding dump.dump.age
+    age -d -i <(security find-generic-password -s '<keychain item>' -w) \
+        -o dump.dump <app_id>-db-<run-id>/dump.dump.age
 
 ## Tests
 
